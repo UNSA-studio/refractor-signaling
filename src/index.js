@@ -2,12 +2,27 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 健康检查
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok' }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
+    // 新增：查询房间是否存在/有多少人
+    if (url.pathname.startsWith('/check/')) {
+      const roomId = url.pathname.split('/')[2];
+      if (!roomId) {
+        return new Response(JSON.stringify({ error: 'Missing room ID' }), { status: 400 });
+      }
+      const room = rooms.get(roomId);
+      const count = room ? room.size : 0;
+      return new Response(JSON.stringify({ roomId: roomId, online: count }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // WebSocket 升级：根据房间 ID 分发
     if (url.pathname.startsWith('/room/')) {
       const roomId = url.pathname.split('/')[2];
       if (!roomId) {
@@ -26,7 +41,7 @@ export default {
   }
 };
 
-let rooms = new Map();
+let rooms = new Map(); // roomId -> Set<WebSocket>
 
 function handleWebSocket(ws, roomId, env) {
   if (!rooms.has(roomId)) {
@@ -58,7 +73,6 @@ function handleWebSocket(ws, roomId, env) {
           });
           break;
         case 'chat':
-          // 转发聊天消息给房间里的所有人
           room.forEach(client => {
             if (client.readyState === WebSocket.READY_STATE_OPEN) {
               client.send(JSON.stringify({ type: 'chat', data: data.data, from: 'peer' }));
