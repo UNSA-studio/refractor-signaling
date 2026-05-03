@@ -1,30 +1,84 @@
-// Cloudflare Worker 入口：将 WebSocket 请求交给 Durable Object 处理
-export { Room } from './room';
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 健康检查
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({ status: 'ok' }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
-    // WebSocket 升级：根据房间 ID 路由到对应的 Durable Object
     if (url.pathname.startsWith('/room/')) {
-      const roomId = url.pathname.split('/')[2]; // 例如 /room/A3F8-B9D2-C7E1-user472
+      const roomId = url.pathname.split('/')[2];
       if (!roomId) {
         return new Response('Missing room ID', { status: 400 });
       }
 
-      // 获取或创建 Durable Object 实例
-      const id = env.ROOM.idFromName(roomId);
-      const stub = env.ROOM.get(id);
-      return stub.fetch(request);
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+
+      handleWebSocket(server, roomId, env);
+
+      return new Response(null, { status: 101, webSocket: client });
     }
 
     return new Response('Refractor Signaling', { status: 200 });
   }
 };
+
+let rooms = new Map();
+
+function handleWebSocket(ws, roomId, env) {
+  if (!rooms.has(roomId)) {
+    rooms.set(roomId, new Set());
+  }
+  const room = rooms.get(roomId);
+  room.add(ws);
+
+  ws.accept();
+
+  ws.addEventListener('message', event => {
+    try {
+      const data = JSON.parse(event.data);
+      switch (data.type) {
+        case 'ping':
+          ws.send(JSON.stringify({ type: 'pong' }));
+          break;
+        case 'signal':
+          room.forEach(client => {
+            if (client !== ws && client.readyState === WebSocket.READY_STATE_OPEN) {
+              client.send(JSON.stringify({ type: 'signal', data: data.data }));
+            }
+          });
+          break;
+        case 'create':
+        case 'join':
+          room.forEach(client => {
+            client.send(JSON.stringify({ type: 'user-joined', count: room.size }));
+          });
+          break;
+        case 'chat':
+          // 转发聊天消息给房间里的所有人
+          room.forEach(client => {
+            if (client.readyState === WebSocket.READY_STATE_OPEN) {
+              client.send(JSON.stringify({ type: 'chat', data: data.data, from: 'peer' }));
+            }
+          });
+          break;
+      }
+    } catch (e) {
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message' }));
+    }
+  });
+
+  ws.addEventListener('close', () => {
+    room.delete(ws);
+    if (room.size === 0) {
+      rooms.delete(roomId);
+    } else {
+      room.forEach(client => {
+        client.send(JSON.stringify({ type: 'user-left', count: room.size }));
+      });
+    }
+  });
+}
