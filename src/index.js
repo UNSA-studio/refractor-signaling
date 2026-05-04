@@ -1,29 +1,24 @@
-// ========== Refractor 信令服务器（Durable Object 版本） ==========
+// ========== Refractor 信令服务器（Durable Object v2） ==========
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // 健康检查
     if (url.pathname === '/health') {
       return jsonResponse({ status: 'ok' });
     }
 
     // ---------- HTTP API ----------
-
-    // 创建房间
     if (request.method === 'POST' && url.pathname === '/create') {
       return createRoom(request, env);
     }
 
-    // 查询房间
     if (url.pathname.startsWith('/check/')) {
       const roomId = url.pathname.split('/')[2];
       if (!roomId) return jsonResponse({ error: 'MISSING_ROOM_ID' }, 400);
       return checkRoom(roomId, env);
     }
 
-    // 删除房间
     if (request.method === 'POST' && url.pathname.startsWith('/delete/')) {
       const roomId = url.pathname.split('/')[2];
       if (!roomId) return jsonResponse({ error: 'MISSING_ROOM_ID' }, 400);
@@ -31,13 +26,12 @@ export default {
     }
 
     // ---------- WebSocket ----------
-
     if (url.pathname.startsWith('/room/')) {
       const roomId = url.pathname.split('/')[2];
       if (!roomId) {
         return new Response('Missing room ID', { status: 400 });
       }
-      // 所有 WebSocket 交由对应的 Durable Object 实例处理
+      // 交给对应的 DO 处理
       const id = env.ROOM.idFromName(roomId);
       const stub = env.ROOM.get(id);
       return stub.fetch(request);
@@ -52,27 +46,64 @@ export class Room {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    // 客户端列表保存在内存中 (Durable Object 保证单实例)
     this.clients = new Set();
+    // 关键：初始化房间状态（默认为未激活）
+    this.isActive = false;
+    this.name = '';
+    this.hasPassword = false;
+    this.passwordHash = '';
+    this.limit = 10;
   }
 
-  // 处理 HTTP 请求（包括 WebSocket 升级）
   async fetch(request) {
     const url = new URL(request.url);
     
+    // WebSocket 升级
     if (request.headers.get('Upgrade') === 'websocket') {
+      if (!this.isActive) {
+        return new Response(JSON.stringify({ error: 'ROOM_NOT_FOUND' }), { status: 404 });
+      }
       const pair = new WebSocketPair();
       const [client, server] = Object.values(pair);
       this.handleWebSocket(server);
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // 其他 HTTP 方法可用于内部操作
+    // 内部 API：激活/更新房间信息
+    if (request.method === 'POST' && url.pathname.endsWith('/activate')) {
+      try {
+        const body = await request.json();
+        this.isActive = true;
+        this.name = body.name || '';
+        this.hasPassword = body.hasPassword || false;
+        this.passwordHash = body.passwordHash || '';
+        this.limit = body.limit || 10;
+        return jsonResponse({ success: true });
+      } catch (e) {
+        return jsonResponse({ error: 'INVALID_REQUEST' }, 400);
+      }
+    }
+
+    // 内部 API：查询房间状态
     if (request.method === 'GET' && url.pathname.endsWith('/status')) {
+      if (!this.isActive) {
+        return jsonResponse({ error: 'ROOM_NOT_FOUND' }, 404);
+      }
       return jsonResponse({
-        clients: this.clients.size,
-        roomId: this.state.id.toString()
+        roomId: this.state.id.toString(),
+        online: this.clients.size,
+        hasPassword: this.hasPassword,
+        limit: this.limit,
+        name: this.name
       });
+    }
+
+    // 内部 API：删除房间
+    if (request.method === 'POST' && url.pathname.endsWith('/deactivate')) {
+      this.isActive = false;
+      this.name = '';
+      this.clients.clear();
+      return jsonResponse({ success: true });
     }
 
     return new Response('Not found', { status: 404 });
@@ -81,8 +112,6 @@ export class Room {
   handleWebSocket(ws) {
     this.clients.add(ws);
     ws.accept();
-
-    // 广播新成员
     this.broadcast({ type: 'user-joined', count: this.clients.size });
 
     ws.addEventListener('message', event => {
@@ -93,14 +122,10 @@ export class Room {
             ws.send(JSON.stringify({ type: 'pong' }));
             break;
           case 'signal':
-            // 转发 WebRTC 信令给其他所有人
             this.broadcast({ type: 'signal', data: data.data }, ws);
             break;
           case 'chat':
             this.broadcast({ type: 'chat', data: data.data, from: 'peer' }, ws);
-            break;
-          case 'join':
-            // join 由服务器自动处理，不需要额外转发
             break;
         }
       } catch (e) {
@@ -113,8 +138,7 @@ export class Room {
       if (this.clients.size > 0) {
         this.broadcast({ type: 'user-left', count: this.clients.size });
       }
-      // 这里不删除房间，房间级别的数据（如名称、密码、上限）
-      // 可以通过 DO 的 state.storage 持久化，这里暂不实现
+      // 注意：不在这里自动 deactivate，由主播决定何时结束直播。
     });
   }
 
@@ -130,10 +154,7 @@ export class Room {
 
 // ========== 辅助函数 ==========
 function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'Content-Type': 'application/json' }
-  });
+  return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
 
 async function createRoom(request, env) {
@@ -142,17 +163,32 @@ async function createRoom(request, env) {
     const roomId = body.roomId;
     if (!roomId) return jsonResponse({ error: 'MISSING_ROOM_ID' }, 400);
 
-    // 检查是否已存在（通过 DO 快速判断）
     const id = env.ROOM.idFromName(roomId);
     const stub = env.ROOM.get(id);
-    // 简单通过获取状态来判断是否存在（这里仅用 /status 端点）
-    const resp = await stub.fetch('https://dummy/status');
-    if (resp.status === 200) {
+
+    // 先检查是否已激活
+    const checkResp = await stub.fetch('https://dummy/status');
+    if (checkResp.status === 200) {
       return jsonResponse({ error: 'ROOM_EXISTS' }, 409);
     }
-    // 实际上 DO 在第一次调用时就会被创建，所以 create 本质上什么都不用做，
-    // 只要 DO 被触达就会存在。但我们仍然保留这个端点用于占位。
-    return jsonResponse({ success: true, roomId });
+
+    // 通知 DO 激活
+    const activateResp = await stub.fetch('https://dummy/activate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: body.name || '',
+        hasPassword: body.hasPassword || false,
+        passwordHash: body.passwordHash || '',
+        limit: body.limit || 10
+      })
+    });
+
+    if (activateResp.status === 200) {
+      return jsonResponse({ success: true, roomId });
+    } else {
+      return jsonResponse({ error: 'CREATE_FAILED' }, 500);
+    }
   } catch (e) {
     return jsonResponse({ error: 'INVALID_REQUEST' }, 400);
   }
@@ -167,15 +203,7 @@ async function checkRoom(roomId, env) {
       return jsonResponse({ error: 'ROOM_NOT_FOUND' }, 404);
     }
     const status = await resp.json();
-    // 这里我们无法直接从 DO 取回房间的名字/密码等元数据，需要进一步设计
-    // 临时方案：只要 DO 存在，就认为房间存在
-    return jsonResponse({
-      roomId,
-      online: status.clients || 0,
-      hasPassword: false,  // 后续可从 DO 存储读取
-      limit: 10,
-      name: roomId
-    });
+    return jsonResponse(status);
   } catch (e) {
     return jsonResponse({ error: 'SERVICE_ERROR' }, 500);
   }
@@ -185,9 +213,12 @@ async function deleteRoom(roomId, env) {
   try {
     const id = env.ROOM.idFromName(roomId);
     const stub = env.ROOM.get(id);
-    // Durable Object 删除需要通过专门的 API，但我们可以简单标记
-    // 这里暂不做真实删除，实际项目中可在 DO 中实现 deleteSelf
-    return jsonResponse({ success: true });
+    const resp = await stub.fetch('https://dummy/deactivate', { method: 'POST' });
+    if (resp.status === 200) {
+      return jsonResponse({ success: true });
+    } else {
+      return jsonResponse({ error: 'DELETE_FAILED' }, 500);
+    }
   } catch (e) {
     return jsonResponse({ error: 'SERVICE_ERROR' }, 500);
   }
