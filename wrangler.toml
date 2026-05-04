@@ -1,3 +1,13 @@
 name = "refractor-signaling"
 main = "src/index.js"
-compatibility_date = "2025-05-02"
+compatibility_date = "2025-05-03"
+
+# Durable Object 绑定
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+# 迁移声明（免费计划必须用 new_sqlite_classes）
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
