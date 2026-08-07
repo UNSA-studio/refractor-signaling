@@ -21,3 +21,6 @@ Thumbs.db
 
 # CodeGraph 本地索引
 .codegraph/
+
+# OpenCode 运行时状态
+.omo/
