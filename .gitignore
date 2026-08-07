@@ -1,0 +1,23 @@
+# Node.js
+node_modules/
+npm-debug.log*
+*.log
+
+# Cloudflare Wrangler
+.wrangler/
+.dev.vars
+.dev.vars.*
+!dev.vars.example
+
+# 环境变量
+.env
+.env.*
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# CodeGraph 本地索引
+.codegraph/
