@@ -58,7 +58,9 @@ Refractor 直播应用的 WebRTC 信令服务器，基于 Cloudflare Workers + D
 - **激活**：通过 `POST /create` 激活，未激活的房间 WebSocket 连接返回 `ROOM_NOT_FOUND`（404）。
 - **密码**：`hasPassword=true` 时，`join` 必须携带正确密码。密码以 Base64（UTF-8）编码存储，与 Android 端 `Base64.encodeToString(password.toByteArray())` 一致。
 - **人数上限**：`limit` 限制房间在线人数，满员时新加入返回 `error: 房间已满` 并关闭（4004）。
-- **生命周期**：主播离开不会自动关闭房间（由 `POST /delete` 或主播重新开播决定）。
+- **生命周期**：
+  - 主播主动结束直播：Android 端调用 `POST /delete/{roomId}`，房间立即删除（连接被关闭）。
+  - 兜底清理：房间全部成员离开后保留 **60 秒**（DO alarm），期间允许主播网络抖动重连；超时后自动删除，防止僵尸房间残留。重新开播（`/create`）会取消待删除 alarm。
 
 ## 本地开发
 

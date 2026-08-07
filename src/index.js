@@ -86,6 +86,25 @@ export class Room {
     });
   }
 
+  /**
+   * DO alarm 处理：房间空置超过 TTL 后自动删除，防止僵尸房间残留。
+   * 由 state.storage.setAlarm() 触发（DO 在内存中或冷启动都会执行）。
+   */
+  async alarm() {
+    await this._loadState();
+    // 仅当房间仍处于未激活/空置状态时清理；若期间有新成员加入会被 deleteAlarm 取消
+    if (!this.isActive) return;
+    if (this.clientIds.size > 0) return; // 还有人在，不做处理（理论上 alarm 已被取消）
+    this.isActive = false;
+    this.name = '';
+    this.hasPassword = false;
+    this.passwordHash = '';
+    this.roomId = '';
+    this.clients.clear();
+    this.clientIds.clear();
+    await this._saveState();
+  }
+
   async fetch(request) {
     await this._loadState();
     const url = new URL(request.url);
@@ -111,6 +130,8 @@ export class Room {
         this.hasPassword = !!body.hasPassword;
         this.passwordHash = body.passwordHash || '';
         this.limit = body.limit || 10;
+        // 房间被重新激活，取消任何待执行的删除 alarm
+        await this.state.storage.deleteAlarm();
         await this._saveState();
         return jsonResponse({ success: true });
       } catch (e) {
@@ -190,6 +211,8 @@ export class Room {
             // 密码验证通过：登记 clientId 并广播加入
             this.clearJoinTimer(ws);
             this.clientIds.set(ws, data.clientId || '');
+            // 有成员加入：取消待执行的空房间删除 alarm
+            this.state.storage.deleteAlarm().catch(() => {});
             this.broadcast({ type: 'user-joined', count: this.clientIds.size });
             break;
           }
@@ -217,8 +240,10 @@ export class Room {
       this.clearJoinTimer(ws);
       if (this.clientIds.size > 0) {
         this.broadcast({ type: 'user-left', count: this.clientIds.size });
+      } else if (this.isActive) {
+        // 房间空置：安排延迟自动删除（给主播网络抖动重连留时间），超时后 alarm() 清理
+        this.state.storage.setAlarm(Date.now() + EMPTY_ROOM_TTL_MS).catch(() => {});
       }
-      // 注意：不在这里自动 deactivate，由主播决定何时结束直播。
     });
   }
 
@@ -246,6 +271,9 @@ export class Room {
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 }
+
+/** 空房间保留时间：全部成员离开后等待 TTL，允许主播网络抖动重连，超时后自动删除房间 */
+const EMPTY_ROOM_TTL_MS = 60_000;
 
 /** UTF-8 安全的 Base64 编码，与 Android 端 Base64.encodeToString(password.toByteArray()) 一致 */
 function base64EncodeUtf8(str) {
