@@ -125,7 +125,7 @@ export class Room {
       }
       return jsonResponse({
         roomId: this.roomId || this.state.id.toString(),
-        online: this.clients.size,
+        online: this.clientIds.size,
         hasPassword: this.hasPassword,
         limit: this.limit,
         name: this.name
@@ -168,6 +168,14 @@ export class Room {
         const data = JSON.parse(event.data);
         switch (data.type) {
           case 'join': {
+            // 人数上限检查（基于已完成 join 的成员数）
+            if (this.limit > 0 && this.clientIds.size >= this.limit) {
+              this.clearJoinTimer(ws);
+              this.clients.delete(ws);
+              ws.send(JSON.stringify({ type: 'error', message: '房间已满' }));
+              ws.close(4004, 'room full');
+              return;
+            }
             // 验证密码：密码不匹配则拒绝加入
             if (this.hasPassword) {
               const sentHash = base64EncodeUtf8(data.password || '');
@@ -182,7 +190,7 @@ export class Room {
             // 密码验证通过：登记 clientId 并广播加入
             this.clearJoinTimer(ws);
             this.clientIds.set(ws, data.clientId || '');
-            this.broadcast({ type: 'user-joined', count: this.clients.size });
+            this.broadcast({ type: 'user-joined', count: this.clientIds.size });
             break;
           }
           case 'ping':
@@ -207,8 +215,8 @@ export class Room {
       this.clients.delete(ws);
       this.clientIds.delete(ws);
       this.clearJoinTimer(ws);
-      if (this.clients.size > 0) {
-        this.broadcast({ type: 'user-left', count: this.clients.size });
+      if (this.clientIds.size > 0) {
+        this.broadcast({ type: 'user-left', count: this.clientIds.size });
       }
       // 注意：不在这里自动 deactivate，由主播决定何时结束直播。
     });
@@ -224,7 +232,8 @@ export class Room {
 
   broadcast(message, excludeWs = null) {
     const msgStr = typeof message === 'string' ? message : JSON.stringify(message);
-    this.clients.forEach(client => {
+    // 只向已完成 join 验证的客户端广播
+    this.clientIds.forEach((clientId, client) => {
       // WebSocket.OPEN(1) 是标准常量；兼容 Workers 与非 Workers 运行环境
       if (client !== excludeWs && client.readyState === WebSocket.OPEN) {
         client.send(msgStr);
